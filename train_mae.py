@@ -147,10 +147,13 @@ def _save_plot(model, imgs, save_path):
     B = original.shape[0]
 
     def _to_np(t):
-        t = t.cpu().mul(0.5).add(0.5).clamp(0, 1)
+        t = t.cpu()
+        if dcfg.get("tanh_space", True):
+            t = t.mul(0.5).add(0.5)
+        t = t.clamp(0, 1)
         if C == 1:
-            return t.squeeze(1).numpy()   # (B, H, W)
-        return t.permute(0, 2, 3, 1).numpy()  # (B, H, W, 3)
+            return t.squeeze(1).numpy()
+        return t.permute(0, 2, 3, 1).numpy()
 
     orig_np   = _to_np(original)
     masked_np = _to_np(masked_img)

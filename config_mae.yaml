@@ -1,10 +1,11 @@
 run_name: mae
 
 data:
-  data_dir: CityScapes/data/stylegan/tanh/256x256
-  img_size: 256
+  data_dir: /mnt/mydrive/ilias/projects/unsupervised_learning/ECCV/CityScapes/data/preprocessed_data
+  img_size: 512
   in_chans: 3
-  batch_size: 64
+  tanh_space: false   # true -> display: x*0.5+0.5; false -> display: clamp(0,1)
+  batch_size: 32
   num_workers: 4
 
 model:
