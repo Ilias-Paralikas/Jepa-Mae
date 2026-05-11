@@ -1,0 +1,29 @@
+run_name: mae
+
+data:
+  data_dir: CityScapes/data/stylegan/tanh/256x256
+  img_size: 256
+  in_chans: 3
+  batch_size: 64
+  num_workers: 4
+
+model:
+  patch_size: 16
+  encoder_embed_dim: 768
+  encoder_depth: 12
+  encoder_num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  mlp_ratio: 4.0
+  mask_ratio: 0.75
+  norm_pix_loss: true
+
+training:
+  epochs: 200
+  lr: 1.5e-4
+  min_lr: 0.0
+  weight_decay: 0.05
+  warmup_epochs: 40
+  save_every: 1
+  plot_every: 200
