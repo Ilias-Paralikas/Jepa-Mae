@@ -9,14 +9,20 @@ data:
 
 model:
   patch_size: 8
-  encoder_embed_dim: 768
-  encoder_depth: 12
-  encoder_num_heads: 16
-  decoder_embed_dim: 512
-  decoder_depth: 8
-  decoder_num_heads: 16
   mlp_ratio: 4.0
   mask_ratio: 0.5
+  patch_embed:
+    hidden_dims: [1024, 1024]
+  encoder:
+    encoder_embed_dim: 768
+    encoder_depth: 12
+    encoder_num_heads: 16
+    mlp_ratio: 4.0
+  decoder:
+    decoder_embed_dim: 512
+    decoder_depth: 8
+    decoder_num_heads: 16
+
 
 training:
   base_dir: runs

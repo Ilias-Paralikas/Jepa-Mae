@@ -27,8 +27,10 @@ from MAE.loss_functions.mse_loss import MSELoss
 # Helpers
 # ---------------------------------------------------------------------------
 
-def denorm(x):
-    return (x * 0.5 + 0.5).clamp(0, 1)
+def denorm(x, tanh_space=True):
+    if tanh_space:
+        return (x * 0.5 + 0.5).clamp(0, 1)
+    return x.clamp(0, 1)
 
 
 def build_scheduler(optimizer, cfg, steps_per_epoch):
@@ -50,7 +52,7 @@ def build_scheduler(optimizer, cfg, steps_per_epoch):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def visualize(images, patchifier, patch_embed, mae, step, epoch, vis_dir, device):
+def visualize(images, patchifier, patch_embed, mae, step, epoch, vis_dir, device, tanh_space=True):
     patch_embed.eval()
     mae.eval()
 
@@ -69,17 +71,22 @@ def visualize(images, patchifier, patch_embed, mae, step, epoch, vis_dir, device
 
         recon_imgs = patchifier.unpatchify(rgb_pred)
 
-    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+        composite_patches = rgb_pred.clone()
+        composite_patches[:, indices] = raw_patches[:, indices]
+        composite_imgs = patchifier.unpatchify(composite_patches)
+
+    fig, axes = plt.subplots(n, 4, figsize=(12, 3 * n))
     if n == 1:
         axes = axes[None]
 
-    axes[0, 0].set_title('Original',      fontsize=10)
-    axes[0, 1].set_title('Visible',        fontsize=10)
-    axes[0, 2].set_title('Reconstructed',  fontsize=10)
+    axes[0, 0].set_title('Original',    fontsize=10)
+    axes[0, 1].set_title('Visible',     fontsize=10)
+    axes[0, 2].set_title('Reconstructed', fontsize=10)
+    axes[0, 3].set_title('Composite',   fontsize=10)
 
     for i in range(n):
-        for j, t in enumerate([imgs[i], visible_imgs[i], recon_imgs[i]]):
-            axes[i, j].imshow(denorm(t).permute(1, 2, 0).cpu().float())
+        for j, t in enumerate([imgs[i], visible_imgs[i], recon_imgs[i], composite_imgs[i]]):
+            axes[i, j].imshow(denorm(t, tanh_space).permute(1, 2, 0).cpu().float())
             axes[i, j].axis('off')
 
     epoch_dir = os.path.join(vis_dir, f'epoch_{epoch:04d}')
@@ -141,20 +148,24 @@ def main():
 
     patchifier  = Patchifier(patch_size, img_size, in_chans)
 
+    encfg = mcfg['encoder']
+    deccfg = mcfg['decoder']
+
     patch_embed = PatchEmbed(
         patch_dim=patch_dim,
-        embed_dim=mcfg['encoder_embed_dim'],
+        embed_dim=encfg['encoder_embed_dim'],
+        hidden_dims=mcfg['patch_embed']['hidden_dims'],
     ).to(device)
 
     mae = MAE(
         num_patches=num_patches,
         patch_dim=patch_dim,
-        encoder_embed_dim=mcfg['encoder_embed_dim'],
-        encoder_depth=mcfg['encoder_depth'],
-        encoder_num_heads=mcfg['encoder_num_heads'],
-        decoder_embed_dim=mcfg['decoder_embed_dim'],
-        decoder_depth=mcfg['decoder_depth'],
-        decoder_num_heads=mcfg['decoder_num_heads'],
+        encoder_embed_dim=encfg['encoder_embed_dim'],
+        encoder_depth=encfg['encoder_depth'],
+        encoder_num_heads=encfg['encoder_num_heads'],
+        decoder_embed_dim=deccfg['decoder_embed_dim'],
+        decoder_depth=deccfg['decoder_depth'],
+        decoder_num_heads=deccfg['decoder_num_heads'],
         mask_ratio=mcfg['mask_ratio'],
         mlp_ratio=mcfg['mlp_ratio'],
     ).to(device)
@@ -209,7 +220,8 @@ def main():
 
             if global_step % tcfg['plot_every'] == 0:
                 visualize(images, patchifier, patch_embed, mae,
-                          global_step, epoch, vis_dir, device)
+                          global_step, epoch, vis_dir, device,
+                          tanh_space=dcfg['tanh_space'])
 
         if (epoch + 1) % tcfg['save_every'] == 0:
             torch.save(patch_embed.state_dict(), os.path.join(save_dir, 'patch_embed.pth'))
