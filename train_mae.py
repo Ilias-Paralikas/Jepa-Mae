@@ -2,228 +2,222 @@ import argparse
 import math
 import os
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--gpu",      default="0")
-parser.add_argument("--config",   default="config_mae.yaml")
-parser.add_argument("--load_run", default=None, type=int)
-args = parser.parse_args()
-os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
 import torch
-import yaml
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-
-from file_management import get_version_folder, save_config, load_config
-from model import MAE
+from tqdm import tqdm
 
 
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../ECCV"))
-from CityScapes.datasets import CityscapesDataset as MyDataset
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from Data.CityScapes.datasets import CityscapesDataset
 
-# ---------------------------------------------------------------------------
-# Config & versioning
-# ---------------------------------------------------------------------------
+from file_management import get_version_folder, load_config, save_config
+from MAE.patchifier import Patchifier
+from MAE.patch_embed import PatchEmbed
+from MAE.mae import MAE
+from MAE.loss_functions.mse_loss import MSELoss
 
-with open(args.config) as f:
-    cfg = yaml.safe_load(f)
-
-version_folder = get_version_folder("runs", cfg["run_name"], load_run=args.load_run)
-
-if args.load_run is not None:
-    cfg = load_config(version_folder)
-else:
-    save_config(cfg, version_folder)
-
-# ---------------------------------------------------------------------------
-# Device
-# ---------------------------------------------------------------------------
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
-
-# ---------------------------------------------------------------------------
-# Dataset & DataLoader
-# ---------------------------------------------------------------------------
-
-dcfg = cfg["data"]
-dataset = MyDataset(
-    data_dir=dcfg["data_dir"],
-    get_labels=False,
-)
-loader = DataLoader(
-    dataset,
-    batch_size=dcfg["batch_size"],
-    shuffle=True,
-    num_workers=dcfg["num_workers"],
-    pin_memory=True,
-    drop_last=True,
-)
-
-# Fixed batch used for progress plots throughout training
-plot_batch = next(iter(loader))[0][:4].to(device)
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-mcfg = cfg["model"]
-model = MAE(
-    img_size=dcfg["img_size"],
-    patch_size=mcfg["patch_size"],
-    in_chans=dcfg["in_chans"],
-    encoder_embed_dim=mcfg["encoder_embed_dim"],
-    encoder_depth=mcfg["encoder_depth"],
-    encoder_num_heads=mcfg["encoder_num_heads"],
-    decoder_embed_dim=mcfg["decoder_embed_dim"],
-    decoder_depth=mcfg["decoder_depth"],
-    decoder_num_heads=mcfg["decoder_num_heads"],
-    mlp_ratio=mcfg["mlp_ratio"],
-    mask_ratio=mcfg["mask_ratio"],
-    norm_pix_loss=mcfg["norm_pix_loss"],
-).to(device)
-
-# ---------------------------------------------------------------------------
-# Optimiser
-# ---------------------------------------------------------------------------
-
-tcfg = cfg["training"]
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"]
-)
-
-# ---------------------------------------------------------------------------
-# Resume
-# ---------------------------------------------------------------------------
-
-start_epoch = 0
-if args.load_run is not None:
-    with open(os.path.join(version_folder, "meta.yaml")) as f:
-        meta = yaml.safe_load(f)
-    last_epoch = meta["epoch"]
-    ckpt_path = os.path.join(version_folder, f"mae_e{last_epoch:03d}.pt")
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    start_epoch = last_epoch + 1
-    print(f"Resumed from epoch {last_epoch} ({ckpt_path})")
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-writer = SummaryWriter(log_dir=os.path.join(version_folder, "tb"))
-plots_dir = os.path.join(version_folder, "plots")
-os.makedirs(plots_dir, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-def _adjust_lr(optimizer, epoch):
-    warmup = tcfg["warmup_epochs"]
-    base_lr, min_lr = tcfg["lr"], tcfg.get("min_lr", 0.0)
-    epochs = tcfg["epochs"]
-    if epoch < warmup:
-        lr = base_lr * (epoch + 1) / warmup
-    else:
-        progress = (epoch - warmup) / max(1, epochs - warmup)
-        lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
-    return lr
+def denorm(x):
+    return (x * 0.5 + 0.5).clamp(0, 1)
 
 
-def _save_plot(model, imgs, save_path):
-    model.eval()
+def build_scheduler(optimizer, cfg, steps_per_epoch):
+    tcfg        = cfg['training']
+    total_steps  = tcfg['epochs'] * steps_per_epoch
+    warmup_steps = tcfg['warmup_epochs'] * steps_per_epoch
+    base_lr      = tcfg['lr']
+    min_lr       = tcfg['min_lr']
+
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / warmup_steps
+        if min_lr == base_lr:
+            return 1.0
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr / base_lr + (1.0 - min_lr / base_lr) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def visualize(images, patchifier, patch_embed, mae, step, epoch, vis_dir, device):
+    patch_embed.eval()
+    mae.eval()
+
+    n = min(4, images.shape[0])
+    imgs = images[:n].to(device)
+
     with torch.no_grad():
-        original, masked_img, recon_img = model.reconstruct(imgs)
+        raw_patches = patchifier.patchify(imgs)
+        patch_embs  = patch_embed(raw_patches)
+        rgb_pred, indices = mae(patch_embs)
 
-    C = original.shape[1]
-    B = original.shape[0]
+        # Visible-only: zero masked positions in raw patch space
+        visible_patches = torch.zeros_like(raw_patches)
+        visible_patches[:, indices] = raw_patches[:, indices]
+        visible_imgs = patchifier.unpatchify(visible_patches)
 
-    def _to_np(t):
-        t = t.cpu()
-        if dcfg.get("tanh_space", True):
-            t = t.mul(0.5).add(0.5)
-        t = t.clamp(0, 1)
-        if C == 1:
-            return t.squeeze(1).numpy()
-        return t.permute(0, 2, 3, 1).numpy()
+        recon_imgs = patchifier.unpatchify(rgb_pred)
 
-    orig_np   = _to_np(original)
-    masked_np = _to_np(masked_img)
-    recon_np  = _to_np(recon_img)
-
-    fig, axes = plt.subplots(B, 3, figsize=(9, 3 * B))
-    if B == 1:
+    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+    if n == 1:
         axes = axes[None]
 
-    for i in range(B):
-        for j, (arr, title) in enumerate([(orig_np[i], "Original"),
-                                           (masked_np[i], "Masked"),
-                                           (recon_np[i], "Reconstructed")]):
-            cmap = "gray" if C == 1 else None
-            axes[i, j].imshow(arr, cmap=cmap)
-            axes[i, j].set_title(title, fontsize=9)
-            axes[i, j].axis("off")
+    axes[0, 0].set_title('Original',      fontsize=10)
+    axes[0, 1].set_title('Visible',        fontsize=10)
+    axes[0, 2].set_title('Reconstructed',  fontsize=10)
 
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=80, bbox_inches="tight")
-    plt.close(fig)
-    model.train()
+    for i in range(n):
+        for j, t in enumerate([imgs[i], visible_imgs[i], recon_imgs[i]]):
+            axes[i, j].imshow(denorm(t).permute(1, 2, 0).cpu().float())
+            axes[i, j].axis('off')
+
+    epoch_dir = os.path.join(vis_dir, f'epoch_{epoch:04d}')
+    os.makedirs(epoch_dir, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(epoch_dir, f'step_{step:07d}.png'), dpi=100)
+    plt.close()
+
+    patch_embed.train()
+    mae.train()
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Main
 # ---------------------------------------------------------------------------
 
-global_step = start_epoch * len(loader)
-plot_every = tcfg["plot_every"]
-save_every = tcfg["save_every"]
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu',      default='0')
+    parser.add_argument('--config',   default='config_mae.yaml')
+    parser.add_argument('--load_run', type=int, default=None,
+                        help='Version number to resume from')
+    args = parser.parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-for epoch in range(start_epoch, tcfg["epochs"]):
-    model.train()
-    lr = _adjust_lr(optimizer, epoch)
+    cfg = load_config('.', args.config)
 
-    totals = {"loss": 0.0}
-    n_batches = 0
+    tcfg = cfg['training']
+    dcfg = cfg['data']
+    mcfg = cfg['model']
 
-    for imgs, _ in loader:
-        imgs = imgs.to(device)
+    save_dir = get_version_folder(tcfg['base_dir'], cfg['run_name'], args.load_run)
+    vis_dir  = os.path.join(save_dir, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
 
-        loss, _pred, _mask = model(imgs)
+    if args.load_run is None:
+        save_config(cfg, save_dir)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
 
-        totals["loss"] += loss.item()
-        n_batches += 1
-        global_step += 1
+    # --- Data ---
+    dataset = CityscapesDataset(get_labels=False)
+    loader  = DataLoader(
+        dataset,
+        batch_size=dcfg['batch_size'],
+        shuffle=True,
+        num_workers=dcfg['num_workers'],
+        pin_memory=True,
+        drop_last=True,
+    )
 
-        if plot_every > 0 and global_step % plot_every == 0:
-            ep_dir = os.path.join(plots_dir, f"e{epoch:03d}")
-            os.makedirs(ep_dir, exist_ok=True)
-            _save_plot(model, plot_batch,
-                       save_path=os.path.join(ep_dir, f"s{global_step:06d}.png"))
+    # --- Models ---
+    img_size    = dcfg['img_size']
+    patch_size  = mcfg['patch_size']
+    in_chans    = dcfg['in_chans']
+    patch_dim   = patch_size * patch_size * in_chans
+    num_patches = (img_size // patch_size) ** 2
 
-    # -- per-epoch logging
-    avg_loss = totals["loss"] / n_batches
-    writer.add_scalar("train/loss", avg_loss, epoch)
-    writer.add_scalar("train/lr",   lr,       epoch)
-    print(f"[epoch {epoch:03d}]  loss={avg_loss:.4f}  lr={lr:.2e}")
+    patchifier  = Patchifier(patch_size, img_size, in_chans)
 
-    # -- checkpoint
-    if (epoch + 1) % save_every == 0:
-        ckpt_path = os.path.join(version_folder, f"mae_e{epoch:03d}.pt")
-        torch.save(model.state_dict(), ckpt_path)
-        with open(os.path.join(version_folder, "meta.yaml"), "w") as f:
-            yaml.dump({"epoch": epoch}, f)
+    patch_embed = PatchEmbed(
+        patch_dim=patch_dim,
+        embed_dim=mcfg['encoder_embed_dim'],
+    ).to(device)
 
-writer.close()
-print("Training complete.")
+    mae = MAE(
+        num_patches=num_patches,
+        patch_dim=patch_dim,
+        encoder_embed_dim=mcfg['encoder_embed_dim'],
+        encoder_depth=mcfg['encoder_depth'],
+        encoder_num_heads=mcfg['encoder_num_heads'],
+        decoder_embed_dim=mcfg['decoder_embed_dim'],
+        decoder_depth=mcfg['decoder_depth'],
+        decoder_num_heads=mcfg['decoder_num_heads'],
+        mask_ratio=mcfg['mask_ratio'],
+        mlp_ratio=mcfg['mlp_ratio'],
+    ).to(device)
+
+    criterion = MSELoss()
+
+    # --- Optimizer & scheduler ---
+    params    = list(patch_embed.parameters()) + list(mae.parameters())
+    optimizer = torch.optim.AdamW(params, lr=tcfg['lr'], weight_decay=tcfg['weight_decay'])
+    scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=len(loader))
+
+    start_epoch = 0
+    global_step = 0
+
+    if args.load_run is not None:
+        patch_embed.load_state_dict(torch.load(os.path.join(save_dir, 'patch_embed.pth'), weights_only=True))
+        mae.load_state_dict(torch.load(os.path.join(save_dir, 'mae.pth'), weights_only=True))
+        optimizer.load_state_dict(torch.load(os.path.join(save_dir, 'optimizer.pth'), weights_only=True))
+        meta        = torch.load(os.path.join(save_dir, 'meta.pth'), weights_only=True)
+        start_epoch = meta['epoch'] + 1
+        global_step = meta['global_step']
+        print(f'Resumed from epoch {start_epoch}, step {global_step}')
+
+    recon_weight = cfg['loss']['reconstruction_weight']
+
+    # --- Training loop ---
+    for epoch in range(start_epoch, tcfg['epochs']):
+        pbar = tqdm(loader, desc=f'Epoch {epoch + 1}/{tcfg["epochs"]}', leave=True)
+
+        for images, _ in pbar:
+            images = images.to(device)
+
+            raw_patches = patchifier.patchify(images)
+            patch_embs  = patch_embed(raw_patches)
+            rgb_pred, indices = mae(patch_embs)
+
+          
+            target = raw_patches
+
+            loss = criterion(rgb_pred, target, indices) * recon_weight
+
+            optimizer.zero_grad()
+            loss.backward()
+            if tcfg['grad_clip'] > 0:
+                nn.utils.clip_grad_norm_(params, tcfg['grad_clip'])
+            optimizer.step()
+            scheduler.step()
+
+            global_step += 1
+            pbar.set_postfix({'loss': f'{loss.item():.4f}',
+                              'lr':   f'{scheduler.get_last_lr()[0]:.2e}'})
+
+            if global_step % tcfg['plot_every'] == 0:
+                visualize(images, patchifier, patch_embed, mae,
+                          global_step, epoch, vis_dir, device)
+
+        if (epoch + 1) % tcfg['save_every'] == 0:
+            torch.save(patch_embed.state_dict(), os.path.join(save_dir, 'patch_embed.pth'))
+            torch.save(mae.state_dict(),         os.path.join(save_dir, 'mae.pth'))
+            torch.save(optimizer.state_dict(),   os.path.join(save_dir, 'optimizer.pth'))
+            torch.save({'epoch': epoch, 'global_step': global_step},
+                       os.path.join(save_dir, 'meta.pth'))
+
+
+if __name__ == '__main__':
+    main()
